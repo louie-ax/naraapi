@@ -11,17 +11,19 @@ from io import BytesIO
 from fastapi import FastAPI, Request
 from supabase import create_client
 from datetime import datetime
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
 
 # 1. 환경변수 로드
 SUPABASE_URL = os.environ.get("https://zxfxouwylutlxragrhzd.supabase.co")
 SUPABASE_KEY = os.environ.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp4ZnhvdXd5bHV0bHhyYWdyaHpkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzQ0NTc5OCwiZXhwIjoyMDc5MDIxNzk4fQ.u_Or1_1p1PU4ekYuLuzXGs1ecqqfzE1Ak9lCU05ebjU")
 
-print("\n========== [Parser Worker v4.0] ==========")
+print("\n========== [Parser Worker v5.0 Ultimate] ==========")
 if SUPABASE_URL: print(f"✅ URL: {SUPABASE_URL[:15]}...")
 else: print("❌ URL Missing")
 if SUPABASE_KEY: print(f"✅ KEY: {SUPABASE_KEY[:10]}...")
 else: print("❌ KEY Missing")
-print("==========================================\n")
+print("===================================================\n")
 
 app = FastAPI()
 
@@ -30,7 +32,15 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     supabase = None
 
-# --- [1. HWP (OLE) 파싱 함수] ---
+# --- [데이터 모델 정의 (UI용)] ---
+class SupabaseWebhook(BaseModel):
+    type: str = "INSERT"
+    table: str = "bid_notices"
+    record: Dict[str, Any]
+    schema_name: str = "public"
+    old_record: Optional[Dict[str, Any]] = None
+
+# --- [1. HWP (OLE) 파싱 함수 - 배포용 문서 감지 추가] ---
 def get_hwp_text(file_bytes):
     try:
         f = BytesIO(file_bytes)
@@ -53,11 +63,13 @@ def get_hwp_text(file_bytes):
             except:
                 unpacked_data = data
             
+            # HWP 텍스트 디코딩
             decoded = unpacked_data.decode('utf-16le', errors='ignore')
             
-            # 배포용 문서 체크 (암호화된 경우)
+            # ★ [핵심] 배포용 문서(암호화) 감지 로직
+            # 외계어(Bƀz耀̀у...) 속에 "배포용 문서"라는 키워드가 숨어있으면 감지함
             if "배포용 문서입니다" in decoded or "Distribution" in decoded:
-                return "(⚠️ 암호화된 배포용 HWP 문서는 텍스트 추출이 불가능합니다)"
+                return "(⚠️ 이 파일은 암호화된 '배포용 HWP 문서'로, 텍스트 추출이 불가능합니다.)"
 
             clean_text = "".join([c for c in decoded if c.isprintable() or c in ['\n', '\t', ' ']])
             text += clean_text + "\n"
@@ -66,35 +78,32 @@ def get_hwp_text(file_bytes):
     except Exception as e:
         return f"(HWP 파싱 실패: {str(e)})"
 
-# --- [2. HWPX (XML) 파싱 함수] ---
+# --- [2. HWPX (XML) 파싱 함수 - 신규 추가] ---
 def get_hwpx_text(file_bytes):
     try:
         text = ""
         with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
-            # HWPX는 zip 안에 xml 파일들이 들어있는 구조입니다.
             for name in zf.namelist():
                 if name.startswith("Contents/section") and name.endswith(".xml"):
                     xml_data = zf.read(name)
                     root = ET.fromstring(xml_data)
-                    
-                    # 네임스페이스 처리 및 텍스트 태그(<hp:t>) 추출
-                    # HWPX 구조상 텍스트는 <hp:t> 태그 안에 있습니다.
+                    # <hp:t> 태그 안의 텍스트 추출
                     for text_tag in root.iter():
-                        if text_tag.tag.endswith('t'): # <hp:t>
+                        if text_tag.tag.endswith('t'): 
                             if text_tag.text:
                                 text += text_tag.text + "\n"
         return text if text else "(HWPX 내용 없음)"
     except Exception as e:
         return f"(HWPX 파싱 실패: {str(e)})"
 
-# --- [3. Excel (XLSX/XLSM) 파싱 함수] ---
+# --- [3. Excel (XLSX/XLSM) 파싱 함수 - 신규 추가] ---
 def get_excel_text(file_bytes):
     try:
         wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
         text = ""
         for sheet in wb.sheetnames:
             ws = wb[sheet]
-            text += f"\n--- Sheet: {sheet} ---\n"
+            text += f"\n--- [Sheet: {sheet}] ---\n"
             for row in ws.iter_rows(values_only=True):
                 # None 값 제외하고 텍스트로 변환하여 합침
                 row_text = " | ".join([str(cell) for cell in row if cell is not None])
@@ -104,21 +113,22 @@ def get_excel_text(file_bytes):
     except Exception as e:
         return f"(Excel 파싱 실패: {str(e)})"
 
-# --- [4. DOCX (Word) 파싱 함수 - 테이블 포함] ---
+# --- [4. DOCX (Word) 파싱 함수 - 테이블 인식 강화] ---
 def get_docx_text(file_bytes):
     try:
         doc = Document(BytesIO(file_bytes))
         text = ""
         
-        # 1. 문단(Paragraphs) 추출
+        # 1. 문단 추출
         for para in doc.paragraphs:
             text += para.text + "\n"
             
-        # 2. 표(Tables) 추출 (순서가 뒤섞일 수 있으나 내용은 확보됨)
+        # 2. ★ [핵심] 표(Table) 내용 추출 추가
         if doc.tables:
-            text += "\n[표 내용 추출]\n"
+            text += "\n=== [표 내용 추출] ===\n"
             for table in doc.tables:
                 for row in table.rows:
+                    # 각 셀의 내용을 ' | ' 로 구분하여 한 줄로 만듦
                     row_text = " | ".join([cell.text.strip() for cell in row.cells])
                     text += row_text + "\n"
                 text += "\n"
@@ -135,14 +145,14 @@ def extract_text_from_file(file_bytes, ext):
         if 'pdf' in ext:
             with fitz.open(stream=file_bytes, filetype="pdf") as doc:
                 for page in doc:
-                    text += page.get_text() # 기본 텍스트 추출
+                    text += page.get_text() # 기본 텍스트 추출 (PDF 표는 텍스트 순서대로 나옴)
         
         # Word
         elif 'docx' in ext or 'doc' in ext:
             text = get_docx_text(file_bytes)
             
         # HWP (Legacy)
-        elif 'hwp' == ext: # hwp (not hwpx)
+        elif 'hwp' == ext: 
             text = get_hwp_text(file_bytes)
             
         # HWPX (XML based)
@@ -154,7 +164,7 @@ def extract_text_from_file(file_bytes, ext):
             text = get_excel_text(file_bytes)
             
         else:
-            text = "(지원하지 않는 파일 형식입니다)"
+            text = f"(지원하지 않는 파일 형식: {ext})"
     except Exception as e:
         text = f"시스템 처리 에러: {str(e)}"
     return text
@@ -163,26 +173,28 @@ def extract_text_from_file(file_bytes, ext):
 
 @app.get("/")
 def read_root():
-    status = "Normal" if supabase else "Error (No Env Vars)"
-    return {"status": f"Worker Ready (v4.0 All-in-One) - {status}"}
+    return {"status": "Worker Ready (v5.0 Ultimate)"}
 
 @app.post("/parse")
-async def parse_notice(request: Request):
+async def parse_notice(payload: SupabaseWebhook):
     if not supabase: return {"status": "Error", "msg": "Env Vars Missing"}
 
     try:
-        payload = await request.json()
-        record = payload.get('record')
+        record = payload.record
+        if not record: return {"msg": "No record"}
 
-        if not record or record.get('process_status') != 'NEW':
-            return {"msg": "Skipped"}
-
+        # 상태 확인 로깅
+        status = record.get('process_status')
         bid_no = record.get('bidNtceNo')
         bid_ord = record.get('bidNtceOrd')
         
-        print(f"🚀 [시작] {bid_no}-{bid_ord}")
+        if status != 'NEW':
+            print(f"⛔ [스킵] {bid_no} 상태가 '{status}' 입니다.")
+            return {"msg": "Skipped"}
+        
+        print(f"🚀 [작업 시작] {bid_no}-{bid_ord}")
 
-        # 상태 변경 (PROCESSING)
+        # 1. 상태 변경 (PROCESSING)
         supabase.table('bid_notices').update({'process_status': 'PROCESSING'})\
             .eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
 
