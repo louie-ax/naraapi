@@ -1,127 +1,166 @@
 import os
 import requests
+import fitz  # pymupdf (PDF용)
+import olefile # HWP용
+import zlib # HWP 압축 해제용
+from docx import Document # DOCX용
+from io import BytesIO
 from fastapi import FastAPI, Request
 from supabase import create_client
 from datetime import datetime
 
-# 환경변수 로드
-SUPABASE_URL = os.environ.get("https://zxfxouwylutlxragrhzd.supabase.co")
-SUPABASE_KEY = os.environ.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp4ZnhvdXd5bHV0bHhyYWdyaHpkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzQ0NTc5OCwiZXhwIjoyMDc5MDIxNzk4fQ.u_Or1_1p1PU4ekYuLuzXGs1ecqqfzE1Ak9lCU05ebjU")
-
-app = FastAPI()
-
-# 1. 환경변수 가져오기
+# 1. 환경변수 가져오기 & 디버깅 (진실의 방)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-app = FastAPI()
-
-# 2. [진실의 방] 로그 출력 (Render 로그에서 확인용)
-print("\n========== [환경변수 로딩 테스트] ==========")
+print("\n========== [환경변수 로딩 점검] ==========")
 if SUPABASE_URL:
-    print(f"✅ SUPABASE_URL 감지됨: {SUPABASE_URL[:15]}... (길이: {len(SUPABASE_URL)})")
+    print(f"✅ URL 감지됨: {SUPABASE_URL[:15]}...")
 else:
-    print("❌ SUPABASE_URL이 없습니다! (None)")
+    print("❌ URL이 없습니다! (None)")
 
 if SUPABASE_KEY:
-    print(f"✅ SUPABASE_KEY 감지됨: {SUPABASE_KEY[:10]}... (길이: {len(SUPABASE_KEY)})")
+    print(f"✅ KEY 감지됨: {SUPABASE_KEY[:10]}...")
 else:
-    print("❌ SUPABASE_KEY가 없습니다! (None)")
+    print("❌ KEY가 없습니다! (None)")
 print("==========================================\n")
 
-# 3. 클라이언트 생성 (없으면 아예 서버를 켜지 말고 에러 내기)
-if not SUPABASE_URL or not SUPABASE_KEY:
-    # 변수가 없으면 여기서 멈춰야 원인을 알 수 있습니다.
-    raise ValueError("🚨 치명적 오류: Supabase 환경변수가 설정되지 않았습니다!")
+app = FastAPI()
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-# Supabase 클라이언트 연결
+# 클라이언트 생성 (변수가 없으면 생성 안 함)
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 else:
     supabase = None
 
+# --- [HWP 파싱 함수] ---
+def get_hwp_text(file_bytes):
+    try:
+        f = BytesIO(file_bytes)
+        ole = olefile.OleFileIO(f)
+        
+        dirs = ole.listdir()
+        body_sections = []
+        for d in dirs:
+            if d[0] == "BodyText":
+                body_sections.append(d)
+        
+        body_sections.sort(key=lambda x: int(x[1][7:]))
+        
+        text = ""
+        for section in body_sections:
+            stream = ole.openstream(section)
+            data = stream.read()
+            try:
+                unpacked_data = zlib.decompress(data, -15)
+            except:
+                unpacked_data = data
+            
+            decoded = unpacked_data.decode('utf-16le', errors='ignore')
+            clean_text = "".join([c for c in decoded if c.isprintable() or c in ['\n', '\t', ' ']])
+            text += clean_text + "\n"
+            
+        return text
+    except Exception as e:
+        return f"(HWP 파싱 실패: {str(e)})"
+
+# --- [통합 파싱 함수 (PDF/DOCX/HWP)] ---
+def extract_text_from_file(file_bytes, ext):
+    text = ""
+    try:
+        if 'pdf' in ext:
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                for page in doc:
+                    text += page.get_text()
+        elif 'docx' in ext or 'doc' in ext:
+            doc = Document(BytesIO(file_bytes))
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        elif 'hwp' in ext:
+            text = get_hwp_text(file_bytes)
+        else:
+            text = "(지원하지 않는 파일 형식입니다)"
+    except Exception as e:
+        text = f"에러: {str(e)}"
+    return text
+
+# -----------------------
+
 @app.get("/")
 def read_root():
-    return {"status": "Worker is ready (v2.0)"}
+    status = "Normal" if supabase else "Error (No Env Vars)"
+    return {"status": f"Worker Ready (v3.0 HWP) - {status}"}
 
 @app.post("/parse")
 async def parse_notice(request: Request):
+    # 안전장치: 환경변수가 없으면 작업 거부
+    if not supabase:
+        return {"status": "Error", "msg": "서버 환경변수 미설정"}
+
     try:
         payload = await request.json()
-        record = payload.get('record') # Webhook이 보낸 데이터
+        record = payload.get('record')
 
-        if not record:
-            return {"msg": "No record data"}
-        
-        # 1. 처리 상태 확인 (NEW가 아니면 스킵)
-        if record.get('process_status') != 'NEW':
-            print(f"SKIP: 상태가 {record.get('process_status')}입니다.")
+        if not record or record.get('process_status') != 'NEW':
             return {"msg": "Skipped"}
 
-        # 2. 식별자 가져오기 (공고번호 + 차수)
         bid_no = record.get('bidNtceNo')
         bid_ord = record.get('bidNtceOrd')
         
-        if not bid_no or not bid_ord:
-             return {"msg": "Primary Key Missing"}
+        print(f"🚀 [시작] {bid_no}-{bid_ord}")
 
-        print(f"🚀 작업 시작: 공고번호[{bid_no}]-차수[{bid_ord}]")
-
-        # 3. 상태 변경 (PROCESSING)
-        # 주의: 복합키이므로 두 가지 조건을 모두 걸어야 함 (.eq 2번 사용)
+        # 상태 변경 (PROCESSING)
         supabase.table('bid_notices').update({'process_status': 'PROCESSING'})\
-            .eq('bidNtceNo', bid_no)\
-            .eq('bidNtceOrd', bid_ord).execute()
+            .eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
 
-        full_text = ""
-        file_count = 0
+        full_log = ""
 
-        # 4. 첨부파일 URL 1~10번 순회하며 다운로드 시뮬레이션
+        # URL 1~10번 순회
         for i in range(1, 11):
-            url_col = f"ntceSpecDocUrl{i}"     # 컬럼명 생성: ntceSpecDocUrl1 ... 10
-            name_col = f"ntceSpecFileNm{i}"    # 파일명 컬럼
+            url_col = f"ntceSpecDocUrl{i}"
+            name_col = f"ntceSpecFileNm{i}"
             
             file_url = record.get(url_col)
-            file_name = record.get(name_col, f"file_{i}")
+            file_name = record.get(name_col, f"File_{i}")
 
-            # URL이 있고(None 아님), 빈 문자열이 아니며, http로 시작할 때
-            if file_url and str(file_url).strip() != "" and str(file_url).startswith("http"):
-                print(f"📥 발견({i}): {file_name} -> {file_url}")
-                
-                # --- [실제 파싱 로직이 들어갈 자리] ---
-                # response = requests.get(file_url)
-                # text = hwp_parser(response.content)
-                # ----------------------------------
-                
-                # 지금은 테스트용 텍스트 생성
-                full_text += f"\n=== [파일 {i}: {file_name}] ===\n(내용 파싱됨...)\nURL: {file_url}\n"
-                file_count += 1
+            if file_url and str(file_url).startswith("http"):
+                print(f"  📥 [다운로드] {file_name}")
+                try:
+                    # 1. 다운로드
+                    response = requests.get(file_url, timeout=60)
+                    file_bytes = response.content
+                    ext = file_name.split('.')[-1].lower()
+                    
+                    # 2. 파싱
+                    parsed_text = extract_text_from_file(file_bytes, ext)
+                    
+                    # 3. ★ 자식 테이블 저장 ★
+                    supabase.table('bid_attachments').insert({
+                        "bidNtceNo": bid_no,
+                        "bidNtceOrd": bid_ord,
+                        "file_name": file_name,
+                        "file_url": file_url,
+                        "file_type": ext,
+                        "extracted_text": parsed_text
+                    }).execute()
+                    
+                    log = f"  💾 [저장] {file_name} ({len(parsed_text)}자)"
+                    print(log)
+                    full_log += log + "\n"
 
-        if file_count == 0:
-            full_text = "첨부파일 URL이 없는 공고입니다."
+                except Exception as e:
+                    print(f"  ⚠️ [실패] {file_name}: {e}")
 
-        # 5. 결과 저장 (DONE) & 파싱 내용 업데이트
+        # 최종 완료 처리
         supabase.table('bid_notices').update({
-            'parsed_content': full_text,
             'process_status': 'DONE',
+            'parsed_content': full_log, # 부모에는 로그만 기록
             'updated_at': datetime.now().isoformat()
         }).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
 
-        print(f"✅ 작업 완료: {bid_no}-{bid_ord}")
+        print(f"✅ [종료] {bid_no}")
         return {"status": "Success"}
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"❌ 에러 발생: {error_msg}")
-        
-        # 에러 발생 시 DB에 로그 남기기
-        if supabase and bid_no and bid_ord:
-            supabase.table('bid_notices').update({
-                'process_status': 'ERROR',
-                'last_error': error_msg
-            }).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
-            
-        return {"status": "Error", "msg": error_msg}
+        print(f"❌ [시스템 에러] {e}")
+        return {"status": "Error", "msg": str(e)}
