@@ -10,6 +10,33 @@ SUPABASE_KEY = os.environ.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJz
 
 app = FastAPI()
 
+# 1. 환경변수 가져오기
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+app = FastAPI()
+
+# 2. [진실의 방] 로그 출력 (Render 로그에서 확인용)
+print("\n========== [환경변수 로딩 테스트] ==========")
+if SUPABASE_URL:
+    print(f"✅ SUPABASE_URL 감지됨: {SUPABASE_URL[:15]}... (길이: {len(SUPABASE_URL)})")
+else:
+    print("❌ SUPABASE_URL이 없습니다! (None)")
+
+if SUPABASE_KEY:
+    print(f"✅ SUPABASE_KEY 감지됨: {SUPABASE_KEY[:10]}... (길이: {len(SUPABASE_KEY)})")
+else:
+    print("❌ SUPABASE_KEY가 없습니다! (None)")
+print("==========================================\n")
+
+# 3. 클라이언트 생성 (없으면 아예 서버를 켜지 말고 에러 내기)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    # 변수가 없으면 여기서 멈춰야 원인을 알 수 있습니다.
+    raise ValueError("🚨 치명적 오류: Supabase 환경변수가 설정되지 않았습니다!")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
 # Supabase 클라이언트 연결
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
