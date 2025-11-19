@@ -15,8 +15,8 @@ from pydantic import BaseModel
 from typing import Dict, Any, Optional
 
 # 1. 환경변수 로드
-SUPABASE_URL = os.environ.get("https://zxfxouwylutlxragrhzd.supabase.co")
-SUPABASE_KEY = os.environ.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp4ZnhvdXd5bHV0bHhyYWdyaHpkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzQ0NTc5OCwiZXhwIjoyMDc5MDIxNzk4fQ.u_Or1_1p1PU4ekYuLuzXGs1ecqqfzE1Ak9lCU05ebjU")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 print("\n========== [Parser Worker v5.0 Ultimate] ==========")
 if SUPABASE_URL: print(f"✅ URL: {SUPABASE_URL[:15]}...")
