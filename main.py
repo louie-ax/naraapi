@@ -1,16 +1,15 @@
 import os
 import requests
-import re
+import re # ★ 정규표현식 모듈 (필수)
 import fitz  # pymupdf
-import pdfplumber
-import olefile
-import zlib
-import zipfile
-import xml.etree.ElementTree as ET
-import openpyxl # xlsx
-import xlrd # xls
-import subprocess # ★ LibreOffice 실행용
-from docx import Document
+import pdfplumber # PDF 표 인식용
+import olefile # HWP용
+import zlib # HWP 압축 해제용
+import zipfile # HWPX용
+import xml.etree.ElementTree as ET # HWPX XML 파싱용
+import openpyxl # xlsx용
+import xlrd # xls용
+from docx import Document # DOCX용
 from docx.document import Document as _Document
 from docx.oxml.text.paragraph import CT_P
 from docx.oxml.table import CT_Tbl
@@ -22,17 +21,19 @@ from supabase import create_client
 from datetime import datetime
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
+import subprocess # LibreOffice용 (Docker 환경에서만 작동)
 
-# 환경변수
+# 1. 환경변수 로드
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-print("\n========== [Worker v10.0 (Docker + LibreOffice)] ==========")
+print("\n========== [Parser Worker v10.1 HWP Clean Fix] ==========")
 if SUPABASE_URL: print(f"✅ URL Loaded")
 else: print("❌ URL Missing")
-print("===========================================================\n")
+print("=========================================================\n")
 
 app = FastAPI()
+
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 else:
@@ -45,17 +46,15 @@ class SupabaseWebhook(BaseModel):
     schema_name: str = "public"
     old_record: Optional[Dict[str, Any]] = None
 
-# --- [1. LibreOffice 변환 함수 (핵심)] ---
+# --- [1. LibreOffice 변환 함수 (Docker 환경용)] ---
 def convert_hwp_to_docx(hwp_bytes):
     filename = "temp.hwp"
     docx_filename = "temp.docx"
     try:
-        # 파일 저장
         with open(filename, "wb") as f:
             f.write(hwp_bytes)
         
-        # 변환 명령 실행 (HWP -> DOCX)
-        # soffice --headless --convert-to docx --outdir . temp.hwp
+        # LibreOffice로 변환 시도
         subprocess.run(
             ["soffice", "--headless", "--convert-to", "docx", "--outdir", ".", filename],
             check=True,
@@ -63,24 +62,19 @@ def convert_hwp_to_docx(hwp_bytes):
             stderr=subprocess.PIPE
         )
         
-        # 변환된 파일 읽기
         if os.path.exists(docx_filename):
             with open(docx_filename, "rb") as f:
                 docx_bytes = f.read()
             return docx_bytes
         return None
-        
     except Exception as e:
-        print(f"⚠️ 변환 실패: {e}")
+        print(f"⚠️ LibreOffice 변환 실패: {e}")
         return None
     finally:
-        # 청소
         if os.path.exists(filename): os.remove(filename)
         if os.path.exists(docx_filename): os.remove(docx_filename)
 
-# --- [기존 파싱 함수들 (v9.0 기능 유지)] ---
-
-# (백업용) 기존 HWP 파서
+# --- [2. HWP 파싱 (백업용 - 강력 정제 적용)] ---
 def get_hwp_text_fallback(file_bytes):
     try:
         f = BytesIO(file_bytes)
@@ -90,133 +84,199 @@ def get_hwp_text_fallback(file_bytes):
         for d in dirs:
             if d[0] == "BodyText": body_sections.append(d)
         body_sections.sort(key=lambda x: int(x[1][7:]))
+        
         raw_text = ""
         for section in body_sections:
             stream = ole.openstream(section)
             data = stream.read()
-            try: unpacked = zlib.decompress(data, -15)
-            except: unpacked = data
-            raw_text += unpacked.decode('utf-16le', errors='ignore')
-        
-        cleaned = re.sub(r'[^가-힣a-zA-Z0-9\s\.\,\-\(\)\[\]\%\~\:\/]', '', raw_text)
-        final = []
-        for line in cleaned.split('\n'):
-            if len(line.strip()) > 1: final.append(line.strip())
-        return "\n".join(final)
-    except: return "(HWP 내용 없음)"
+            try: unpacked_data = zlib.decompress(data, -15)
+            except: unpacked_data = data
+            
+            # 1차 디코딩 (제어문자 포함됨)
+            decoded = unpacked_data.decode('utf-16le', errors='ignore')
+            raw_text += decoded
 
+        # 배포용 문서 체크
+        if "배포용 문서입니다" in raw_text or "Distribution" in raw_text:
+             return "(⚠️ 암호화된 배포용 HWP 문서는 텍스트 추출이 불가능합니다)"
+
+        # --- [★ 정제 로직 시작 ★] ---
+        # 1. 허용된 문자만 남기기 (한글, 영문, 숫자, 기본 특수문자)
+        cleaned_text = re.sub(r'[^가-힣a-zA-Z0-9\s\.\,\-\(\)\[\]\%\~\:\/\_]', '', raw_text)
+        
+        # 2. 쓰레기 줄(Line) 제거
+        final_lines = []
+        for line in cleaned_text.split('\n'):
+            line = line.strip()
+            
+            # (1) 너무 짧은 줄 제거
+            if len(line) < 2: continue
+            
+            # (2) 유효성 검사: 한글이 있거나, 숫자가 2자리 이상 포함된 줄만 살림
+            if re.search(r'[가-힣]', line) or re.search(r'[0-9]{2,}', line):
+                final_lines.append(line)
+
+        return "\n".join(final_lines) if final_lines else "(HWP 내용 없음)"
+
+    except Exception as e: return f"(HWP 오류: {str(e)})"
+    
+# --- [3. HWPX 파싱] ---
 def get_hwpx_text(file_bytes):
     try:
         text = ""
         with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
             for name in zf.namelist():
                 if name.startswith("Contents/section") and name.endswith(".xml"):
-                    root = ET.fromstring(zf.read(name))
-                    for t in root.iter():
-                        if t.tag.endswith('t') and t.text: text += t.text + "\n"
-        return text
-    except: return "(HWPX 오류)"
+                    xml_data = zf.read(name)
+                    root = ET.fromstring(xml_data)
+                    for text_tag in root.iter():
+                        if text_tag.tag.endswith('t') and text_tag.text:
+                            text += text_tag.text + "\n"
+        return text if text else "(HWPX 내용 없음)"
+    except Exception as e: return f"(HWPX 오류: {str(e)})"
 
+# --- [4-1. XLSX/XLSM (신형 엑셀) 파싱] ---
 def get_xlsx_text(file_bytes):
     try:
         wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
         text = ""
         for sheet in wb.sheetnames:
             ws = wb[sheet]
-            text += f"\n### [{sheet}]\n"
+            text += f"\n### [Sheet: {sheet}]\n"
             rows = list(ws.iter_rows(values_only=True))
             if not rows: continue
-            headers = [str(c).replace('\n',' ').strip() if c else "" for c in rows[0]]
-            text += "| " + " | ".join(headers) + " |\n|" + "---|"*len(headers) + "\n"
+            
+            headers = [str(cell).replace('\n', ' ').strip() if cell is not None else "" for cell in rows[0]]
+            text += "| " + " | ".join(headers) + " |\n"
+            text += "| " + " | ".join(["---"] * len(headers)) + " |\n"
+            
             for row in rows[1:]:
-                cells = [str(c).replace('\n',' ').strip() if c else "" for c in row]
-                if any(cells): text += "| " + " | ".join(cells) + " |\n"
+                row_cells = [str(cell).replace('\n', ' ').strip() if cell is not None else "" for cell in row]
+                if any(row_cells):
+                    text += "| " + " | ".join(row_cells) + " |\n"
             text += "\n"
         return text
-    except: return "(XLSX 오류)"
+    except Exception as e: return f"(XLSX 오류: {str(e)})"
 
+# --- [4-2. XLS (구형 엑셀) 파싱] ---
 def get_xls_text(file_bytes):
     try:
         wb = xlrd.open_workbook(file_contents=file_bytes)
         text = ""
-        for s in wb.sheet_names():
-            ws = wb.sheet_by_name(s)
-            text += f"\n### [{s}]\n"
+        for sheet_name in wb.sheet_names():
+            ws = wb.sheet_by_name(sheet_name)
+            text += f"\n### [Sheet: {sheet_name}]\n"
             if ws.nrows == 0: continue
-            headers = [str(ws.cell_value(0,c)).replace('\n',' ').strip() for c in range(ws.ncols)]
-            text += "| " + " | ".join(headers) + " |\n|" + "---|"*len(headers) + "\n"
+
+            headers = [str(ws.cell_value(0, c)).replace('\n', ' ').strip() for c in range(ws.ncols)]
+            text += "| " + " | ".join(headers) + " |\n"
+            text += "| " + " | ".join(["---"] * len(headers)) + " |\n"
+
             for r in range(1, ws.nrows):
-                cells = [str(ws.cell_value(r,c)).replace('\n',' ').strip() for c in range(ws.ncols)]
-                if any(cells): text += "| " + " | ".join(cells) + " |\n"
+                row_cells = [str(ws.cell_value(r, c)).replace('\n', ' ').strip() for c in range(ws.ncols)]
+                if any(row_cells):
+                    text += "| " + " | ".join(row_cells) + " |\n"
             text += "\n"
         return text
-    except: return "(XLS 오류)"
+    except Exception as e: return f"(XLS 오류: {str(e)})"
 
-# DOCX 파서 (순서 정렬 + 표 마크다운)
+
+# --- [5. DOCX 파싱 (순서 정렬)] ---
 def iter_block_items(parent):
-    if isinstance(parent, _Document): parent_elm = parent.element.body
-    elif isinstance(parent, _Cell): parent_elm = parent._tc
-    else: return
+    if isinstance(parent, _Document):
+        parent_elm = parent.element.body
+    elif isinstance(parent, _Cell):
+        parent_elm = parent._tc
+    else:
+        return
+
     for child in parent_elm.iterchildren():
-        if isinstance(child, CT_P): yield Paragraph(child, parent)
-        elif isinstance(child, CT_Tbl): yield Table(child, parent)
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
 
 def get_docx_text(file_bytes):
     try:
         doc = Document(BytesIO(file_bytes))
         full_text = []
+        
         for block in iter_block_items(doc):
             if isinstance(block, Paragraph):
-                if block.text.strip(): full_text.append(block.text)
+                if block.text.strip():
+                    full_text.append(block.text)
+            
             elif isinstance(block, Table):
                 if not block.rows: continue
                 full_text.append("\n")
-                rows = []
+                rows_data = []
                 for row in block.rows:
-                    cells = [c.text.strip().replace("\n", " ") for c in row.cells]
-                    rows.append(cells)
-                if not rows: continue
-                headers = rows[0]
-                full_text.append("| " + " | ".join(headers) + " |")
-                full_text.append("| " + " | ".join(["---"]*len(headers)) + " |")
-                for r in rows[1:]: full_text.append("| " + " | ".join(r) + " |")
-                full_text.append("\n")
-        return "\n".join(full_text)
-    except Exception as e: return f"(DOCX 오류: {e})"
+                    row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                    rows_data.append(row_cells)
+                
+                if not rows_data: continue
 
+                headers = rows_data[0]
+                full_text.append("| " + " | ".join(headers) + " |")
+                full_text.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                for row in rows_data[1:]:
+                    full_text.append("| " + " | ".join(row) + " |")
+                full_text.append("\n")
+
+        return "\n".join(full_text)
+    except Exception as e: return f"(DOCX 오류: {str(e)})"
+
+# --- [6. PDF 파싱 (표 중복 제거)] ---
 def get_pdf_text(file_bytes):
     try:
         text_output = []
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
+            for page_num, page in enumerate(pdf.pages):
+                text_output.append(f"\n### [Page {page_num + 1}]")
+                
                 tables = page.find_tables()
-                bboxes = [t.bbox for t in tables]
-                def not_table(obj):
-                    if obj["object_type"] == "char":
-                        cx, cy = (obj["x0"]+obj["x1"])/2, (obj["top"]+obj["bottom"])/2
-                        for b in bboxes:
-                            if b[0]<=cx<=b[2] and b[1]<=cy<=b[3]: return False
-                    return True
-                
-                raw = page.filter(not_table).extract_text(layout=True)
-                if raw: text_output.append(raw)
-                
-                extracted = page.extract_tables()
-                if extracted:
-                    text_output.append("\n")
-                    for tbl in extracted:
-                        clean = [[(str(c).replace('\n',' ') if c else "") for c in r] for r in tbl]
-                        clean = [r for r in clean if any(r)]
-                        if not clean: continue
-                        h = clean[0]
-                        text_output.append("| " + " | ".join(h) + " |")
-                        text_output.append("| " + " | ".join(["---"]*len(h)) + " |")
-                        for r in clean[1:]: text_output.append("| " + " | ".join(r) + " |")
-                    text_output.append("\n")
-        return "\n".join(text_output)
-    except: return "(PDF 오류)"
+                table_bboxes = [table.bbox for table in tables]
 
-# --- [통합 핸들러 (수정됨)] ---
+                def not_within_tables(obj):
+                    if obj["object_type"] == "char":
+                        x0, top, x1, bottom = obj["x0"], obj["top"], obj["x1"], obj["bottom"]
+                        cx, cy = (x0 + x1) / 2, (top + bottom) / 2
+                        for bbox in table_bboxes:
+                            if bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
+                                return False
+                    return True
+
+                filtered_page = page.filter(not_within_tables)
+                raw_text = filtered_page.extract_text(layout=True)
+                if raw_text: text_output.append(raw_text)
+
+                extracted_tables = page.extract_tables()
+                if extracted_tables:
+                    text_output.append("\n")
+                    for table in extracted_tables:
+                        clean_table = []
+                        for row in table:
+                            clean_row = [str(cell).replace('\n', ' ').strip() if cell is not None else "" for cell in row]
+                            if any(clean_row): clean_table.append(clean_row)
+                        
+                        if not clean_table: continue
+                        
+                        headers = clean_table[0]
+                        text_output.append("| " + " | ".join(headers) + " |")
+                        text_output.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                        for row in clean_table[1:]:
+                            text_output.append("| " + " | ".join(row) + " |")
+                        text_output.append("\n")
+        return "\n".join(text_output)
+    except Exception as e:
+        try:
+            t = ""
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                for p in doc: t += p.get_text()
+            return t
+        except: return f"(PDF 오류: {str(e)})"
+
+# --- [통합 핸들러] ---
 def extract_text_from_file(file_bytes, ext):
     ext = ext.lower()
     try:
@@ -225,35 +285,39 @@ def extract_text_from_file(file_bytes, ext):
         elif 'hwpx' in ext: return get_hwpx_text(file_bytes)
         elif 'xlsx' in ext or 'xlsm' in ext: return get_xlsx_text(file_bytes)
         elif 'xls' in ext: return get_xls_text(file_bytes)
-        
-        # ★ HWP 처리 로직 변경 ★
         elif 'hwp' == ext:
+            # 1. LibreOffice 변환 시도 (Docker 환경용)
             print("  🔄 [변환] HWP -> DOCX 변환 시도 (LibreOffice)")
-            # 1. LibreOffice로 DOCX 변환
             docx_bytes = convert_hwp_to_docx(file_bytes)
             
             if docx_bytes:
                 print("  ✨ [성공] DOCX 변환 성공 -> 표 파싱 진행")
-                # 2. 변환된 DOCX를 우리가 만든 강력한 DOCX 파서로 처리
-                return get_docx_text(docx_bytes)
+                return get_docx_text(docx_bytes) # 표 구조 완벽 파싱
             else:
-                print("  ⚠️ [실패] 변환 실패 -> 기존 방식(텍스트만) 사용")
-                return get_hwp_text_fallback(file_bytes)
-
-        else: return f"(지원불가: {ext})"
+                print("  ⚠️ [실패] 변환 실패 -> 백업 방식(텍스트만) 사용")
+                return get_hwp_text_fallback(file_bytes) # 텍스트 정제 파싱
+        else: return f"(지원하지 않는 파일: {ext})"
     except Exception as e: return f"시스템 에러: {str(e)}"
 
 # --- [엔드포인트] ---
+@app.get("/")
+def read_root():
+    return {"status": "Worker v10.1 (HWP Noise Filter)"}
+
 @app.post("/parse")
 async def parse_notice(payload: SupabaseWebhook):
     if not supabase: return {"status": "Error", "msg": "Env Vars Missing"}
+
     try:
         record = payload.record
-        if not record or record.get('process_status') != 'NEW': return {"msg": "Skipped"}
-        
+        if not record: return {"msg": "No record"}
+
         bid_no = record.get('bidNtceNo')
-        print(f"🚀 [시작] {bid_no}")
-        supabase.table('bid_notices').update({'process_status': 'PROCESSING'}).eq('bidNtceNo', bid_no).execute()
+        bid_ord = record.get('bidNtceOrd')
+        if record.get('process_status') != 'NEW': return {"msg": "Skipped"}
+        
+        print(f"🚀 [시작] {bid_no}-{bid_ord}")
+        supabase.table('bid_notices').update({'process_status': 'PROCESSING'}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
         
         full_log = ""
         for i in range(1, 11):
@@ -265,16 +329,21 @@ async def parse_notice(payload: SupabaseWebhook):
                 try:
                     resp = requests.get(url, timeout=60)
                     text = extract_text_from_file(resp.content, name.split('.')[-1])
+                    
                     supabase.table('bid_attachments').insert({
-                        "bidNtceNo": bid_no, "bidNtceOrd": record.get('bidNtceOrd'),
+                        "bidNtceNo": bid_no, "bidNtceOrd": bid_ord,
                         "file_name": name, "file_url": url, "file_type": name.split('.')[-1],
                         "extracted_text": text
                     }).execute()
-                    full_log += f"  💾 [성공] {name}\n"
+                    full_log += f"  💾 [성공] {name} ({len(text)}자)\n"
                 except Exception as e:
                     full_log += f"  ❌ [실패] {name}\n"
-                    print(f"에러: {e}")
+                    print(f"실패: {e}")
 
-        supabase.table('bid_notices').update({'process_status': 'DONE', 'parsed_content': full_log, 'updated_at': datetime.now().isoformat()}).eq('bidNtceNo', bid_no).execute()
+        supabase.table('bid_notices').update({'process_status': 'DONE', 'parsed_content': full_log, 'updated_at': datetime.now().isoformat()}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
+        print(f"✅ [완료] {bid_no}")
         return {"status": "Success"}
-    except Exception as e: return {"status": "Error", "msg": str(e)}
+
+    except Exception as e:
+        print(f"❌ [에러] {e}")
+        return {"status": "Error", "msg": str(e)}

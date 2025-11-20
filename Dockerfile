@@ -1,5 +1,5 @@
-# 1. 베이스 이미지 (파이썬 3.9)
-FROM python:3.9-slim
+# 1. 베이스 이미지 (파이썬 3.11)
+FROM python:3.11-slim
 
 # 2. LibreOffice 및 한글 폰트, 필수 도구 설치
 RUN apt-get update && apt-get install -y \
