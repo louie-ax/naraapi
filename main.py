@@ -46,42 +46,52 @@ class SupabaseWebhook(BaseModel):
     schema_name: str = "public"
     old_record: Optional[Dict[str, Any]] = None
 
-# --- [1. LibreOffice 변환 함수 (디버깅 강화)] ---
+# --- [1. LibreOffice 변환 함수 (Render/Docker 권한 문제 해결판)] ---
 def convert_hwp_to_docx(hwp_bytes):
-    filename = "temp.hwp"
-    docx_filename = "temp.docx"
+    # Render/Docker 환경에서는 /tmp 폴더만 쓰기 권한이 확실합니다.
+    temp_dir = "/tmp" 
+    filename = os.path.join(temp_dir, f"temp_{datetime.now().timestamp()}.hwp")
+    docx_filename = filename.replace(".hwp", ".docx")
+    
     try:
+        # 1. HWP 파일을 /tmp에 저장
         with open(filename, "wb") as f:
             f.write(hwp_bytes)
         
-        # ★ 디버깅: 변환 명령 실행 및 결과 상세 출력
-        print("  🔄 [LibreOffice] 변환 시작...")
+        print(f"  🔄 [LibreOffice] 변환 시작... (경로: {filename})")
+        
+        # 2. 환경변수 설정 (핵심!)
+        # LibreOffice가 설정 파일을 쓸 수 있도록 HOME을 /tmp로 속입니다.
+        my_env = os.environ.copy()
+        my_env['HOME'] = temp_dir
+        
+        # 3. 변환 명령 실행
+        # --outdir를 /tmp로 명시
         result = subprocess.run(
-            ["soffice", "--headless", "--convert-to", "docx", "--outdir", ".", filename],
-            capture_output=True, # stdout, stderr 캡처
-            text=True            # 텍스트로 결과 받기
+            ["soffice", "--headless", "--convert-to", "docx", "--outdir", temp_dir, filename],
+            check=False, # 에러나도 파이썬이 죽지 않게 False
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=my_env # 가짜 HOME 환경변수 주입
         )
         
-        # 결과 확인
-        if result.returncode != 0:
-            print(f"  ❌ [LibreOffice 에러] Return Code: {result.returncode}")
-            print(f"  ❌ [STDERR]: {result.stderr}")
-            print(f"  ❌ [STDOUT]: {result.stdout}")
-            return None
-            
+        # 4. 결과 확인
         if os.path.exists(docx_filename):
-            print("  ✨ [LibreOffice] 변환 성공! DOCX 파일 생성됨.")
+            print("  ✨ [LibreOffice] 변환 성공! DOCX 생성됨.")
             with open(docx_filename, "rb") as f:
                 docx_bytes = f.read()
             return docx_bytes
         else:
-            print("  ⚠️ [LibreOffice] 에러는 없었으나 DOCX 파일이 생성되지 않음.")
+            # 실패 시 로그 출력
+            print(f"  ⚠️ [LibreOffice 실패] 파일 생성 안됨.")
+            print(f"  [STDERR]: {result.stderr.decode('utf-8', errors='ignore')}")
             return None
 
     except Exception as e:
-        print(f"  ⚠️ [시스템 에러] 변환 중 예외 발생: {e}")
+        print(f"  ⚠️ [시스템 에러] 변환 중 예외: {e}")
         return None
     finally:
+        # 5. 청소 (반드시 /tmp 파일 삭제)
         if os.path.exists(filename): os.remove(filename)
         if os.path.exists(docx_filename): os.remove(docx_filename)
 
