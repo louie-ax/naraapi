@@ -23,6 +23,9 @@ olefile==0.47
 openpyxl==3.1.5
 packaging==25.0
 pandas==2.3.3
+pdfminer.six==20251107
+pdfplumber==0.11.8
+pillow==12.0.0
 postgrest==2.24.0
 propcache==0.4.1
 pycparser==2.23
@@ -30,6 +33,7 @@ pydantic==2.12.4
 pydantic_core==2.41.5
 PyJWT==2.10.1
 PyMuPDF==1.26.6
+pypdfium2==5.0.0
 python-dateutil==2.9.0.post0
 python-docx==1.2.0
 pytz==2025.2

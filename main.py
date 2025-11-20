@@ -1,6 +1,7 @@
 import os
 import requests
-import fitz  # pymupdf (PDF용)
+import fitz  # pymupdf (일반 텍스트용)
+import pdfplumber # ★ PDF 표 인식용 (신규)
 import olefile # HWP용
 import zlib # HWP 압축 해제용
 import zipfile # HWPX용
@@ -14,16 +15,14 @@ from datetime import datetime
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 
-# 1. 환경변수 로드
+# 환경변수 로드
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-print("\n========== [Parser Worker v5.0 Ultimate] ==========")
-if SUPABASE_URL: print(f"✅ URL: {SUPABASE_URL[:15]}...")
+print("\n========== [Parser Worker v6.0 Table Master] ==========")
+if SUPABASE_URL: print(f"✅ URL Loaded")
 else: print("❌ URL Missing")
-if SUPABASE_KEY: print(f"✅ KEY: {SUPABASE_KEY[:10]}...")
-else: print("❌ KEY Missing")
-print("===================================================\n")
+print("=======================================================\n")
 
 app = FastAPI()
 
@@ -32,7 +31,6 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     supabase = None
 
-# --- [데이터 모델 정의 (UI용)] ---
 class SupabaseWebhook(BaseModel):
     type: str = "INSERT"
     table: str = "bid_notices"
@@ -40,18 +38,20 @@ class SupabaseWebhook(BaseModel):
     schema_name: str = "public"
     old_record: Optional[Dict[str, Any]] = None
 
-# --- [1. HWP (OLE) 파싱 함수 - 배포용 문서 감지 추가] ---
+# --- [1. HWP (OLE) 파싱 - 텍스트 순차 추출] ---
 def get_hwp_text(file_bytes):
     try:
         f = BytesIO(file_bytes)
         ole = olefile.OleFileIO(f)
-        
         dirs = ole.listdir()
+        
+        # BodyText 섹션 탐색 (본문 내용)
         body_sections = []
         for d in dirs:
             if d[0] == "BodyText":
                 body_sections.append(d)
         
+        # 섹션 순서대로 정렬
         body_sections.sort(key=lambda x: int(x[1][7:]))
         
         text = ""
@@ -63,22 +63,26 @@ def get_hwp_text(file_bytes):
             except:
                 unpacked_data = data
             
-            # HWP 텍스트 디코딩
+            # UTF-16LE 디코딩
             decoded = unpacked_data.decode('utf-16le', errors='ignore')
             
-            # ★ [핵심] 배포용 문서(암호화) 감지 로직
-            # 외계어(Bƀz耀̀у...) 속에 "배포용 문서"라는 키워드가 숨어있으면 감지함
+            # 암호화 문서 체크
             if "배포용 문서입니다" in decoded or "Distribution" in decoded:
-                return "(⚠️ 이 파일은 암호화된 '배포용 HWP 문서'로, 텍스트 추출이 불가능합니다.)"
+                return "(⚠️ 암호화된 배포용 HWP 문서는 텍스트 추출이 불가능합니다)"
 
-            clean_text = "".join([c for c in decoded if c.isprintable() or c in ['\n', '\t', ' ']])
+            # 텍스트 정제 (제어문자 제거하되 줄바꿈은 유지)
+            clean_text = ""
+            for c in decoded:
+                if c.isprintable() or c in ['\n', '\t', ' ']:
+                    clean_text += c
+            
             text += clean_text + "\n"
             
-        return text
+        return text if text.strip() else "(HWP 텍스트 없음)"
     except Exception as e:
         return f"(HWP 파싱 실패: {str(e)})"
 
-# --- [2. HWPX (XML) 파싱 함수 - 신규 추가] ---
+# --- [2. HWPX (XML) 파싱] ---
 def get_hwpx_text(file_bytes):
     try:
         text = ""
@@ -87,93 +91,154 @@ def get_hwpx_text(file_bytes):
                 if name.startswith("Contents/section") and name.endswith(".xml"):
                     xml_data = zf.read(name)
                     root = ET.fromstring(xml_data)
-                    # <hp:t> 태그 안의 텍스트 추출
                     for text_tag in root.iter():
-                        if text_tag.tag.endswith('t'): 
-                            if text_tag.text:
-                                text += text_tag.text + "\n"
+                        if text_tag.tag.endswith('t') and text_tag.text:
+                            text += text_tag.text + "\n"
         return text if text else "(HWPX 내용 없음)"
     except Exception as e:
         return f"(HWPX 파싱 실패: {str(e)})"
 
-# --- [3. Excel (XLSX/XLSM) 파싱 함수 - 신규 추가] ---
+# --- [3. Excel 파싱 - 마크다운 표 변환] ---
 def get_excel_text(file_bytes):
     try:
         wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
         text = ""
         for sheet in wb.sheetnames:
             ws = wb[sheet]
-            text += f"\n--- [Sheet: {sheet}] ---\n"
-            for row in ws.iter_rows(values_only=True):
-                # None 값 제외하고 텍스트로 변환하여 합침
-                row_text = " | ".join([str(cell) for cell in row if cell is not None])
-                if row_text.strip():
-                    text += row_text + "\n"
+            text += f"\n### 시트명: {sheet}\n"
+            
+            # 엑셀 내용을 마크다운 표로 변환
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows: continue
+
+            # 헤더 생성 (첫 줄)
+            headers = rows[0]
+            header_str = "| " + " | ".join([str(h) if h else " " for h in headers]) + " |"
+            separator = "| " + " | ".join(["---"] * len(headers)) + " |"
+            
+            text += header_str + "\n" + separator + "\n"
+            
+            # 데이터 생성
+            for row in rows[1:]:
+                row_str = "| " + " | ".join([str(cell).replace("\n", " ") if cell is not None else " " for cell in row]) + " |"
+                text += row_str + "\n"
+            text += "\n"
+
         return text
     except Exception as e:
         return f"(Excel 파싱 실패: {str(e)})"
 
-# --- [4. DOCX (Word) 파싱 함수 - 테이블 인식 강화] ---
+# --- [4. DOCX 파싱 - ★ 표 인식 강화 ★] ---
 def get_docx_text(file_bytes):
     try:
         doc = Document(BytesIO(file_bytes))
-        text = ""
+        full_text = []
         
-        # 1. 문단 추출
+        # 문서의 요소들을 순서대로 읽는 것은 python-docx에서 어렵습니다.
+        # 대신, 문단을 먼저 다 읽고 -> 그 다음 표를 마크다운으로 변환해서 붙입니다.
+        
+        # 1. 일반 텍스트 (Paragraphs)
+        full_text.append("=== [문서 본문] ===")
         for para in doc.paragraphs:
-            text += para.text + "\n"
-            
-        # 2. ★ [핵심] 표(Table) 내용 추출 추가
+            if para.text.strip():
+                full_text.append(para.text)
+        
+        # 2. 표 (Tables) -> 마크다운 변환
         if doc.tables:
-            text += "\n=== [표 내용 추출] ===\n"
+            full_text.append("\n=== [표 데이터 (Table)] ===")
             for table in doc.tables:
-                for row in table.rows:
-                    # 각 셀의 내용을 ' | ' 로 구분하여 한 줄로 만듦
-                    row_text = " | ".join([cell.text.strip() for cell in row.cells])
-                    text += row_text + "\n"
-                text += "\n"
-        return text
+                # 표가 비어있으면 패스
+                if not table.rows: continue
+                
+                # 각 행을 처리
+                for i, row in enumerate(table.rows):
+                    # 셀 안의 줄바꿈은 공백으로 치환 (표 깨짐 방지)
+                    row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                    row_str = "| " + " | ".join(row_cells) + " |"
+                    full_text.append(row_str)
+                    
+                    # 첫 번째 행(헤더) 밑에 구분선 추가
+                    if i == 0:
+                        sep_str = "| " + " | ".join(["---"] * len(row_cells)) + " |"
+                        full_text.append(sep_str)
+                
+                full_text.append("") # 표 사이 공백
+                
+        return "\n".join(full_text)
     except Exception as e:
         return f"(DOCX 파싱 실패: {str(e)})"
+
+# --- [5. PDF 파싱 - ★ pdfplumber 도입 ★] ---
+def get_pdf_text(file_bytes):
+    try:
+        text = ""
+        # pdfplumber로 열기
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                # 1. 텍스트 추출
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+                
+                # 2. 표 추출 (마크다운 변환)
+                tables = page.extract_tables()
+                if tables:
+                    text += "\n[PDF 표 데이터]\n"
+                    for table in tables:
+                        # table은 리스트의 리스트 형태 [[값, 값], [값, 값]]
+                        # None 값 제거 및 줄바꿈 제거
+                        clean_table = [[(str(cell).replace("\n", " ") if cell else "") for cell in row] for row in table]
+                        
+                        if not clean_table: continue
+
+                        # 헤더 처리
+                        headers = clean_table[0]
+                        header_str = "| " + " | ".join(headers) + " |"
+                        sep_str = "| " + " | ".join(["---"] * len(headers)) + " |"
+                        
+                        text += header_str + "\n" + sep_str + "\n"
+                        
+                        # 데이터 처리
+                        for row in clean_table[1:]:
+                            row_str = "| " + " | ".join(row) + " |"
+                            text += row_str + "\n"
+                        text += "\n"
+                        
+        return text
+    except Exception as e:
+        # pdfplumber 실패 시 fitz(pymupdf)로 백업 시도
+        try:
+            text = ""
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                for page in doc: text += page.get_text()
+            return text
+        except Exception as e2:
+            return f"(PDF 파싱 실패: {str(e)})"
 
 # --- [통합 파싱 핸들러] ---
 def extract_text_from_file(file_bytes, ext):
     ext = ext.lower()
-    text = ""
     try:
-        # PDF
         if 'pdf' in ext:
-            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-                for page in doc:
-                    text += page.get_text() # 기본 텍스트 추출 (PDF 표는 텍스트 순서대로 나옴)
-        
-        # Word
+            return get_pdf_text(file_bytes)
         elif 'docx' in ext or 'doc' in ext:
-            text = get_docx_text(file_bytes)
-            
-        # HWP (Legacy)
-        elif 'hwp' == ext: 
-            text = get_hwp_text(file_bytes)
-            
-        # HWPX (XML based)
+            return get_docx_text(file_bytes)
+        elif 'hwp' == ext:
+            return get_hwp_text(file_bytes)
         elif 'hwpx' in ext:
-            text = get_hwpx_text(file_bytes)
-            
-        # Excel
+            return get_hwpx_text(file_bytes)
         elif 'xlsx' in ext or 'xlsm' in ext:
-            text = get_excel_text(file_bytes)
-            
+            return get_excel_text(file_bytes)
         else:
-            text = f"(지원하지 않는 파일 형식: {ext})"
+            return f"(지원하지 않는 파일 형식: {ext})"
     except Exception as e:
-        text = f"시스템 처리 에러: {str(e)}"
-    return text
+        return f"시스템 처리 에러: {str(e)}"
 
 # -----------------------
 
 @app.get("/")
 def read_root():
-    return {"status": "Worker Ready (v5.0 Ultimate)"}
+    return {"status": "Worker Ready (v6.0 Table Support)"}
 
 @app.post("/parse")
 async def parse_notice(payload: SupabaseWebhook):
@@ -183,24 +248,21 @@ async def parse_notice(payload: SupabaseWebhook):
         record = payload.record
         if not record: return {"msg": "No record"}
 
-        # 상태 확인 로깅
-        status = record.get('process_status')
         bid_no = record.get('bidNtceNo')
         bid_ord = record.get('bidNtceOrd')
+        status = record.get('process_status')
         
         if status != 'NEW':
-            print(f"⛔ [스킵] {bid_no} 상태가 '{status}' 입니다.")
+            print(f"⛔ [스킵] {bid_no} 상태: {status}")
             return {"msg": "Skipped"}
         
-        print(f"🚀 [작업 시작] {bid_no}-{bid_ord}")
+        print(f"🚀 [시작] {bid_no}-{bid_ord}")
 
-        # 1. 상태 변경 (PROCESSING)
         supabase.table('bid_notices').update({'process_status': 'PROCESSING'})\
             .eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
 
         full_report = ""
 
-        # URL 1~10번 순회
         for i in range(1, 11):
             url_col = f"ntceSpecDocUrl{i}"
             name_col = f"ntceSpecFileNm{i}"
@@ -215,10 +277,8 @@ async def parse_notice(payload: SupabaseWebhook):
                     file_bytes = response.content
                     ext = file_name.split('.')[-1].lower()
                     
-                    # 파싱 수행
                     parsed_text = extract_text_from_file(file_bytes, ext)
                     
-                    # 자식 테이블 저장
                     supabase.table('bid_attachments').insert({
                         "bidNtceNo": bid_no,
                         "bidNtceOrd": bid_ord,
@@ -236,7 +296,6 @@ async def parse_notice(payload: SupabaseWebhook):
                     print(f"  ⚠️ [실패] {file_name}: {e}")
                     full_report += f"  ❌ [에러] {file_name}\n"
 
-        # 최종 완료
         supabase.table('bid_notices').update({
             'process_status': 'DONE',
             'parsed_content': full_report,
