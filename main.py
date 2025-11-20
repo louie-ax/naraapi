@@ -17,7 +17,7 @@ from docx.oxml.table import CT_Tbl
 from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 from io import BytesIO
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from supabase import create_client
 from datetime import datetime
 from pydantic import BaseModel
@@ -27,13 +27,17 @@ from typing import Dict, Any, Optional
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-print("\n========== [Parser Worker v11.0 Final] ==========")
+print("\n========== [Parser Worker v10.2 HWP Logic Update] ==========")
 if SUPABASE_URL: print(f"✅ URL Loaded")
 else: print("❌ URL Missing")
-print("=================================================\n")
+print("============================================================\n")
 
 app = FastAPI()
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
 
 class SupabaseWebhook(BaseModel):
     type: str = "INSERT"
@@ -50,6 +54,7 @@ def convert_hwp_to_docx(hwp_bytes):
         with open(filename, "wb") as f:
             f.write(hwp_bytes)
         
+        # LibreOffice로 변환 시도
         subprocess.run(
             ["soffice", "--headless", "--convert-to", "docx", "--outdir", ".", filename],
             check=True,
@@ -69,7 +74,7 @@ def convert_hwp_to_docx(hwp_bytes):
         if os.path.exists(filename): os.remove(filename)
         if os.path.exists(docx_filename): os.remove(docx_filename)
 
-# --- [2. HWP 파싱 (강력 정제 적용)] ---
+# --- [2. HWP 파싱 (백업용 - 강력 정제 적용)] ---
 def get_hwp_text(file_bytes):
     try:
         f = BytesIO(file_bytes)
@@ -87,21 +92,25 @@ def get_hwp_text(file_bytes):
             try: unpacked_data = zlib.decompress(data, -15)
             except: unpacked_data = data
             
+            # 1차 디코딩
             decoded = unpacked_data.decode('utf-16le', errors='ignore')
             raw_text += decoded
 
+        # 배포용 문서 체크
         if "배포용 문서입니다" in raw_text or "Distribution" in raw_text:
              return "(⚠️ 암호화된 배포용 HWP 문서는 텍스트 추출이 불가능합니다)"
 
-        # 정제: 한글, 영문, 숫자, 기본 특수문자만 남김
+        # --- [★ 정제 로직 ★] ---
+        # 1. 허용된 문자만 남기기
         cleaned_text = re.sub(r'[^가-힣a-zA-Z0-9\s\.\,\-\(\)\[\]\%\~\:\/\_]', '', raw_text)
         
-        # 쓰레기 줄 제거
+        # 2. 쓰레기 줄(Line) 제거
         final_lines = []
         for line in cleaned_text.split('\n'):
             line = line.strip()
             if len(line) < 2: continue
-            # 한글이나 숫자가 포함된 줄만 살림
+            
+            # 유효성 검사: 한글이 있거나, 숫자가 2자리 이상 포함된 줄만 살림
             if re.search(r'[가-힣]', line) or re.search(r'[0-9]{2,}', line):
                 final_lines.append(line)
 
@@ -169,7 +178,7 @@ def get_xls_text(file_bytes):
         return text
     except Exception as e: return f"(XLS 오류: {str(e)})"
 
-# --- [5. DOCX 파싱 (순서 정렬)] ---
+# --- [5. DOCX 파싱] ---
 def iter_block_items(parent):
     if isinstance(parent, _Document):
         parent_elm = parent.element.body
@@ -210,7 +219,7 @@ def get_docx_text(file_bytes):
         return "\n".join(full_text)
     except Exception as e: return f"(DOCX 오류: {str(e)})"
 
-# --- [6. PDF 파싱 (표 중복 제거)] ---
+# --- [6. PDF 파싱] ---
 def get_pdf_text(file_bytes):
     try:
         text_output = []
@@ -270,63 +279,64 @@ def extract_text_from_file(file_bytes, ext):
         elif 'xlsx' in ext or 'xlsm' in ext: return get_xlsx_text(file_bytes)
         elif 'xls' in ext: return get_xls_text(file_bytes)
         elif 'hwp' == ext:
+            # 1. LibreOffice 변환 시도
             print("  🔄 [변환] HWP -> DOCX 변환 시도 (LibreOffice)")
             docx_bytes = convert_hwp_to_docx(file_bytes)
+            
             if docx_bytes:
-                print("  ✨ [성공] DOCX 변환 성공")
+                print("  ✨ [성공] DOCX 변환 성공 -> 표 파싱 진행")
                 return get_docx_text(docx_bytes)
             else:
-                print("  ⚠️ [실패] 변환 실패 -> 정제 방식 사용")
-                return get_hwp_text(file_bytes)
+                print("  ⚠️ [실패] 변환 실패 -> 백업 방식(텍스트 정제) 사용")
+                return get_hwp_text(file_bytes) # 수정된 함수 호출
         else: return f"(지원하지 않는 파일: {ext})"
     except Exception as e: return f"시스템 에러: {str(e)}"
 
-# --- [비동기 작업 함수] ---
-async def process_parsing(record: Dict[str, Any]):
-    bid_no = record.get('bidNtceNo')
-    bid_ord = record.get('bidNtceOrd')
-    
-    print(f"🚀 [작업 시작] {bid_no}-{bid_ord}")
-    supabase.table('bid_notices').update({'process_status': 'PROCESSING'}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
-    
-    full_log = ""
-    for i in range(1, 11):
-        url = record.get(f"ntceSpecDocUrl{i}")
-        name = record.get(f"ntceSpecFileNm{i}", f"File_{i}")
-
-        if url and str(url).startswith("http"):
-            print(f"  📥 [다운로드] {name}")
-            try:
-                resp = requests.get(url, timeout=60)
-                text = extract_text_from_file(resp.content, name.split('.')[-1])
-                
-                supabase.table('bid_attachments').insert({
-                    "bidNtceNo": bid_no, "bidNtceOrd": bid_ord,
-                    "file_name": name, "file_url": url, "file_type": name.split('.')[-1],
-                    "extracted_text": text
-                }).execute()
-                full_log += f"  💾 [성공] {name} ({len(text)}자)\n"
-            except Exception as e:
-                full_log += f"  ❌ [실패] {name}\n"
-                print(f"실패: {e}")
-
-    supabase.table('bid_notices').update({'process_status': 'DONE', 'parsed_content': full_log, 'updated_at': datetime.now().isoformat()}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
-    print(f"✅ [완료] {bid_no}")
-
-# --- [메인 엔드포인트] ---
+# --- [엔드포인트] ---
 @app.get("/")
 def read_root():
-    return {"status": "Worker v11.0 (Async + Final)"}
+    return {"status": "Worker v10.2 (HWP Logic Update)"}
 
 @app.post("/parse")
-async def parse_notice(payload: SupabaseWebhook, background_tasks: BackgroundTasks):
+async def parse_notice(payload: SupabaseWebhook):
     if not supabase: return {"status": "Error", "msg": "Env Vars Missing"}
-    
-    record = payload.record
-    if not record: return {"msg": "No record"}
-    if record.get('process_status') != 'NEW': return {"msg": "Skipped"}
-    
-    # 비동기 작업 등록 (즉시 응답 후 백그라운드 실행)
-    background_tasks.add_task(process_parsing, record)
-    
-    return {"status": "Accepted", "msg": "Background task started"}
+
+    try:
+        record = payload.record
+        if not record: return {"msg": "No record"}
+
+        bid_no = record.get('bidNtceNo')
+        bid_ord = record.get('bidNtceOrd')
+        if record.get('process_status') != 'NEW': return {"msg": "Skipped"}
+        
+        print(f"🚀 [시작] {bid_no}-{bid_ord}")
+        supabase.table('bid_notices').update({'process_status': 'PROCESSING'}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
+        
+        full_log = ""
+        for i in range(1, 11):
+            url = record.get(f"ntceSpecDocUrl{i}")
+            name = record.get(f"ntceSpecFileNm{i}", f"File_{i}")
+
+            if url and str(url).startswith("http"):
+                print(f"  📥 [다운로드] {name}")
+                try:
+                    resp = requests.get(url, timeout=60)
+                    text = extract_text_from_file(resp.content, name.split('.')[-1])
+                    
+                    supabase.table('bid_attachments').insert({
+                        "bidNtceNo": bid_no, "bidNtceOrd": bid_ord,
+                        "file_name": name, "file_url": url, "file_type": name.split('.')[-1],
+                        "extracted_text": text
+                    }).execute()
+                    full_log += f"  💾 [성공] {name} ({len(text)}자)\n"
+                except Exception as e:
+                    full_log += f"  ❌ [실패] {name}\n"
+                    print(f"실패: {e}")
+
+        supabase.table('bid_notices').update({'process_status': 'DONE', 'parsed_content': full_log, 'updated_at': datetime.now().isoformat()}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
+        print(f"✅ [완료] {bid_no}")
+        return {"status": "Success"}
+
+    except Exception as e:
+        print(f"❌ [에러] {e}")
+        return {"status": "Error", "msg": str(e)}
