@@ -46,7 +46,7 @@ class SupabaseWebhook(BaseModel):
     schema_name: str = "public"
     old_record: Optional[Dict[str, Any]] = None
 
-# --- [1. LibreOffice 변환 함수] ---
+# --- [1. LibreOffice 변환 함수 (디버깅 강화)] ---
 def convert_hwp_to_docx(hwp_bytes):
     filename = "temp.hwp"
     docx_filename = "temp.docx"
@@ -54,21 +54,32 @@ def convert_hwp_to_docx(hwp_bytes):
         with open(filename, "wb") as f:
             f.write(hwp_bytes)
         
-        # LibreOffice로 변환 시도
-        subprocess.run(
+        # ★ 디버깅: 변환 명령 실행 및 결과 상세 출력
+        print("  🔄 [LibreOffice] 변환 시작...")
+        result = subprocess.run(
             ["soffice", "--headless", "--convert-to", "docx", "--outdir", ".", filename],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            capture_output=True, # stdout, stderr 캡처
+            text=True            # 텍스트로 결과 받기
         )
         
+        # 결과 확인
+        if result.returncode != 0:
+            print(f"  ❌ [LibreOffice 에러] Return Code: {result.returncode}")
+            print(f"  ❌ [STDERR]: {result.stderr}")
+            print(f"  ❌ [STDOUT]: {result.stdout}")
+            return None
+            
         if os.path.exists(docx_filename):
+            print("  ✨ [LibreOffice] 변환 성공! DOCX 파일 생성됨.")
             with open(docx_filename, "rb") as f:
                 docx_bytes = f.read()
             return docx_bytes
-        return None
+        else:
+            print("  ⚠️ [LibreOffice] 에러는 없었으나 DOCX 파일이 생성되지 않음.")
+            return None
+
     except Exception as e:
-        print(f"⚠️ LibreOffice 변환 실패: {e}")
+        print(f"  ⚠️ [시스템 에러] 변환 중 예외 발생: {e}")
         return None
     finally:
         if os.path.exists(filename): os.remove(filename)
