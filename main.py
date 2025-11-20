@@ -39,7 +39,7 @@ class SupabaseWebhook(BaseModel):
     old_record: Optional[Dict[str, Any]] = None
 
 # --- [1. HWP (OLE) 파싱 - 텍스트 순차 추출] ---
-# --- [수정된 HWP 파싱 함수 (v7.0)] ---
+# --- [v7.1 강력한 HWP 정제 함수] ---
 def get_hwp_text(file_bytes):
     try:
         f = BytesIO(file_bytes)
@@ -47,8 +47,6 @@ def get_hwp_text(file_bytes):
         
         dirs = ole.listdir()
         body_sections = []
-        
-        # BodyText 섹션 찾기
         for d in dirs:
             if d[0] == "BodyText":
                 body_sections.append(d)
@@ -61,37 +59,50 @@ def get_hwp_text(file_bytes):
             stream = ole.openstream(section)
             data = stream.read()
             
-            # 압축 해제 시도 (HWP 5.0+)
+            # 압축 해제
             try:
                 unpacked_data = zlib.decompress(data, -15)
             except:
                 unpacked_data = data
             
-            # UTF-16LE 디코딩
+            # 1. UTF-16LE 디코딩
             decoded = unpacked_data.decode('utf-16le', errors='ignore')
             
-            # --- [★ 핵심 수정: 강력한 텍스트 필터링 ★] ---
-            # 한글(가-힣), 영문, 숫자, 기본 특수문자, 공백만 허용
-            # 나머지 제어문자나 외계어는 모두 제거
-            filtered_text = ""
-            for char in decoded:
-                # 한글 범위: 0xAC00 ~ 0xD7A3
-                # 영문/숫자/특수문자: 0x0020 ~ 0x007E
-                # 줄바꿈/탭: \n, \t, \r
-                code = ord(char)
-                if (0xAC00 <= code <= 0xD7A3) or \
-                   (0x0020 <= code <= 0x007E) or \
-                   char in ['\n', '\t', '\r', ' ']:
-                    filtered_text += char
-            
-            text += filtered_text + "\n"
-            
-        # 결과가 비어있거나 너무 짧으면(헤더만 읽은 경우) 실패 처리
-        if len(text.strip()) < 10:
-             return "(HWP 텍스트 추출 실패 - 내용 없음)"
+            # 2. 배포용 문서 체크
+            if "배포용 문서입니다" in decoded or "Distribution" in decoded:
+                return "(⚠️ 암호화된 배포용 HWP 문서는 텍스트 추출이 불가능합니다)"
 
-        return text
+            # 3. ★ [핵심] 강력한 화이트리스트 필터링 ★
+            # 의미 있는 문자만 남기고 나머지는 다 버립니다.
+            clean_text = ""
+            for char in decoded:
+                code = ord(char)
+                
+                # (1) 한글 범위 (완성형 + 자모 + 호환자모)
+                if (0xAC00 <= code <= 0xD7A3) or (0x1100 <= code <= 0x11FF) or (0x3130 <= code <= 0x318F):
+                    clean_text += char
+                
+                # (2) 영어 / 숫자 / 기본 특수문자 (ASCII 32~126)
+                elif (0x0020 <= code <= 0x007E):
+                    clean_text += char
+                
+                # (3) 줄바꿈 / 탭
+                elif char in ['\n', '\r', '\t']:
+                    clean_text += char
+                
+                # (4) 한국어 문맥 특수문자 (전각기호, 원화표시 등)
+                # 예: '※', '①', '㈜', '㎡' 등을 살리기 위함
+                elif (0xFF00 <= code <= 0xFFEF) or (0x2000 <= code <= 0x206F) or code == 0x20A9:
+                    clean_text += char
+            
+            # 섹션별 내용 합치기
+            text += clean_text + "\n"
+            
+        # 불필요한 공백/줄바꿈 정리
+        final_text = "\n".join([line.strip() for line in text.split('\n') if line.strip()])
         
+        return final_text if final_text else "(HWP 텍스트 추출 실패 - 내용 없음)"
+
     except Exception as e:
         return f"(HWP 파싱 시스템 에러: {str(e)})"
 
@@ -182,50 +193,69 @@ def get_docx_text(file_bytes):
         return f"(DOCX 파싱 실패: {str(e)})"
 
 # --- [5. PDF 파싱 - ★ pdfplumber 도입 ★] ---
+# --- [v7.3 PDF 파싱 함수 - 마크다운 표 변환 강화] ---
 def get_pdf_text(file_bytes):
     try:
         text = ""
-        # pdfplumber로 열기
+        # pdfplumber로 정밀 분석
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                # 1. 텍스트 추출
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
+            for page_num, page in enumerate(pdf.pages):
+                text += f"\n### [Page {page_num + 1}]\n"
+
+                # 1. 일반 텍스트 먼저 추출 (표가 아닌 부분)
+                # (layout=True는 텍스트 위치를 최대한 보존함)
+                raw_text = page.extract_text(layout=True)
+                if raw_text:
+                    text += raw_text + "\n\n"
                 
-                # 2. 표 추출 (마크다운 변환)
+                # 2. 표(Table) 추출 및 마크다운 변환
                 tables = page.extract_tables()
+                
                 if tables:
-                    text += "\n[PDF 표 데이터]\n"
+                    text += "\n--- [PDF 표 데이터] ---\n"
+                    
                     for table in tables:
-                        # table은 리스트의 리스트 형태 [[값, 값], [값, 값]]
-                        # None 값 제거 및 줄바꿈 제거
-                        clean_table = [[(str(cell).replace("\n", " ") if cell else "") for cell in row] for row in table]
+                        # table 변수는 [[값, 값], [값, 값]] 형태의 리스트입니다.
+                        
+                        # 데이터 정제: None -> 빈 문자열, 줄바꿈 -> 공백 치환
+                        # 마크다운 표 안에서는 줄바꿈(\n)이 있으면 표가 깨지므로 공백으로 바꿉니다.
+                        clean_table = []
+                        for row in table:
+                            clean_row = [
+                                str(cell).replace('\n', ' ').strip() if cell is not None else "" 
+                                for cell in row
+                            ]
+                            # 빈 행(모두 빈칸)은 제외
+                            if any(clean_row):
+                                clean_table.append(clean_row)
                         
                         if not clean_table: continue
 
-                        # 헤더 처리
+                        # 마크다운 표 생성
+                        # (1) 헤더 (첫 번째 줄)
                         headers = clean_table[0]
                         header_str = "| " + " | ".join(headers) + " |"
-                        sep_str = "| " + " | ".join(["---"] * len(headers)) + " |"
+                        separator = "| " + " | ".join(["---"] * len(headers)) + " |"
                         
-                        text += header_str + "\n" + sep_str + "\n"
+                        text += header_str + "\n" + separator + "\n"
                         
-                        # 데이터 처리
+                        # (2) 데이터 (두 번째 줄부터)
                         for row in clean_table[1:]:
                             row_str = "| " + " | ".join(row) + " |"
                             text += row_str + "\n"
-                        text += "\n"
                         
+                        text += "\n" # 표 사이 공백
+
         return text
+
     except Exception as e:
-        # pdfplumber 실패 시 fitz(pymupdf)로 백업 시도
+        # pdfplumber 실패 시 fitz(pymupdf)로 백업 시도 (최소한 텍스트라도 건지기 위함)
         try:
-            text = ""
+            fallback_text = ""
             with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-                for page in doc: text += page.get_text()
-            return text
-        except Exception as e2:
+                for page in doc: fallback_text += page.get_text()
+            return f"(표 인식 실패, 일반 텍스트 추출됨)\n{fallback_text}"
+        except:
             return f"(PDF 파싱 실패: {str(e)})"
 
 # --- [통합 파싱 핸들러] ---
