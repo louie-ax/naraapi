@@ -20,6 +20,7 @@ from supabase import create_client
 from datetime import datetime
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
+import xlrd
 
 # 환경변수 로드
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
