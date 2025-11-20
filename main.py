@@ -1,7 +1,7 @@
 import os
 import requests
 import fitz  # pymupdf (일반 텍스트용)
-import pdfplumber # ★ PDF 표 인식용 (신규)
+import pdfplumber # ★ PDF 표 인식용
 import olefile # HWP용
 import zlib # HWP 압축 해제용
 import zipfile # HWPX용
@@ -39,14 +39,16 @@ class SupabaseWebhook(BaseModel):
     old_record: Optional[Dict[str, Any]] = None
 
 # --- [1. HWP (OLE) 파싱 - 텍스트 순차 추출] ---
+# --- [수정된 HWP 파싱 함수 (v7.0)] ---
 def get_hwp_text(file_bytes):
     try:
         f = BytesIO(file_bytes)
         ole = olefile.OleFileIO(f)
-        dirs = ole.listdir()
         
-        # BodyText 섹션 탐색 (본문 내용)
+        dirs = ole.listdir()
         body_sections = []
+        
+        # BodyText 섹션 찾기
         for d in dirs:
             if d[0] == "BodyText":
                 body_sections.append(d)
@@ -58,6 +60,8 @@ def get_hwp_text(file_bytes):
         for section in body_sections:
             stream = ole.openstream(section)
             data = stream.read()
+            
+            # 압축 해제 시도 (HWP 5.0+)
             try:
                 unpacked_data = zlib.decompress(data, -15)
             except:
@@ -66,21 +70,30 @@ def get_hwp_text(file_bytes):
             # UTF-16LE 디코딩
             decoded = unpacked_data.decode('utf-16le', errors='ignore')
             
-            # 암호화 문서 체크
-            if "배포용 문서입니다" in decoded or "Distribution" in decoded:
-                return "(⚠️ 암호화된 배포용 HWP 문서는 텍스트 추출이 불가능합니다)"
+            # --- [★ 핵심 수정: 강력한 텍스트 필터링 ★] ---
+            # 한글(가-힣), 영문, 숫자, 기본 특수문자, 공백만 허용
+            # 나머지 제어문자나 외계어는 모두 제거
+            filtered_text = ""
+            for char in decoded:
+                # 한글 범위: 0xAC00 ~ 0xD7A3
+                # 영문/숫자/특수문자: 0x0020 ~ 0x007E
+                # 줄바꿈/탭: \n, \t, \r
+                code = ord(char)
+                if (0xAC00 <= code <= 0xD7A3) or \
+                   (0x0020 <= code <= 0x007E) or \
+                   char in ['\n', '\t', '\r', ' ']:
+                    filtered_text += char
+            
+            text += filtered_text + "\n"
+            
+        # 결과가 비어있거나 너무 짧으면(헤더만 읽은 경우) 실패 처리
+        if len(text.strip()) < 10:
+             return "(HWP 텍스트 추출 실패 - 내용 없음)"
 
-            # 텍스트 정제 (제어문자 제거하되 줄바꿈은 유지)
-            clean_text = ""
-            for c in decoded:
-                if c.isprintable() or c in ['\n', '\t', ' ']:
-                    clean_text += c
-            
-            text += clean_text + "\n"
-            
-        return text if text.strip() else "(HWP 텍스트 없음)"
+        return text
+        
     except Exception as e:
-        return f"(HWP 파싱 실패: {str(e)})"
+        return f"(HWP 파싱 시스템 에러: {str(e)})"
 
 # --- [2. HWPX (XML) 파싱] ---
 def get_hwpx_text(file_bytes):
