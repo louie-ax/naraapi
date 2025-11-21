@@ -42,62 +42,53 @@ class SupabaseWebhook(BaseModel):
     schema_name: str = "public"
     old_record: Optional[Dict[str, Any]] = None
 
-# --- [1. LibreOffice 변환 함수 (Docker 환경용)] ---
+# --- [1. LibreOffice 변환 함수 (Docker 환경용 - 권한 문제 해결)] ---
 def convert_hwp_to_docx(hwp_bytes):
-    # 임시 파일 경로 설정 (/tmp 사용)
+    # Render/Docker 환경에서는 /tmp 폴더만 쓰기 권한이 확실합니다.
     temp_dir = "/tmp"
     unique_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
     filename = os.path.join(temp_dir, f"source_{unique_id}.hwp")
     docx_filename = os.path.join(temp_dir, f"source_{unique_id}.docx")
     
     try:
-        # HWP 파일 저장
+        # 1. HWP 파일을 /tmp에 저장
         with open(filename, "wb") as f:
             f.write(hwp_bytes)
         
-        file_size = os.path.getsize(filename)
-        print(f"  🔄 [LibreOffice] 변환 시작... (파일크기: {file_size} bytes)")
-
-        # 변환 명령 실행
-        # -env:UserInstallation 옵션으로 프로필 격리 (권한 문제 해결)
-        cmd = [
-            "soffice", 
-            "--headless", 
-            "--convert-to", "docx", 
-            "--outdir", temp_dir, 
-            f"-env:UserInstallation=file://{temp_dir}/libO_profile_{unique_id}",
-            filename
-        ]
+        print(f"  🔄 [LibreOffice] 변환 시도... (경로: {filename})")
         
+        # 2. 환경변수 설정 (핵심!)
+        # LibreOffice가 설정 파일을 쓸 수 있도록 HOME을 /tmp로 속입니다.
+        my_env = os.environ.copy()
+        my_env['HOME'] = temp_dir
+        
+        # 3. 변환 명령 실행
         result = subprocess.run(
-            cmd,
-            capture_output=True, # stdout, stderr 캡처
-            text=True            # 텍스트로 결과 받기
+            ["soffice", "--headless", "--convert-to", "docx", "--outdir", temp_dir, filename],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=my_env
         )
         
-        if result.returncode != 0:
-            print(f"  ❌ [LibreOffice 에러] Return Code: {result.returncode}")
-            # 에러 메시지 출력 (줄바꿈 제거)
-            print(f"  [STDERR]: {result.stderr.replace('\n', ' ')}")
-            return None
-            
+        # 4. 결과 확인
         if os.path.exists(docx_filename):
             print("  ✨ [LibreOffice] 변환 성공! DOCX 생성됨.")
             with open(docx_filename, "rb") as f:
                 docx_bytes = f.read()
             return docx_bytes
         else:
-            print(f"  ⚠️ [LibreOffice 실패] 변환 파일 없음.")
+            # 실패 시 로그 출력
+            print(f"  ⚠️ [LibreOffice 실패] 파일 생성 안됨.")
             return None
 
     except Exception as e:
         print(f"  ⚠️ [시스템 에러] 변환 중 예외: {e}")
         return None
     finally:
-        # 파일 청소
+        # 5. 청소
         if os.path.exists(filename): os.remove(filename)
         if os.path.exists(docx_filename): os.remove(docx_filename)
-        # 프로필 디렉토리는 /tmp에 생성되므로 자동 삭제됨 (또는 명시적 삭제 추가 가능)
 
 # --- [2. HWP 파싱 (백업용 - 강력 정제 적용)] ---
 def get_hwp_text_fallback(file_bytes):
@@ -199,7 +190,7 @@ def get_xls_text(file_bytes):
         return text
     except Exception as e: return f"(XLS 오류: {str(e)})"
 
-# --- [5. DOCX 파싱 (순서 정렬)] ---
+# --- [5. DOCX 파싱] ---
 def iter_block_items(parent):
     if isinstance(parent, _Document):
         parent_elm = parent.element.body
@@ -240,7 +231,7 @@ def get_docx_text(file_bytes):
         return "\n".join(full_text)
     except Exception as e: return f"(DOCX 오류: {str(e)})"
 
-# --- [6. PDF 파싱 (표 중복 제거)] ---
+# --- [6. PDF 파싱] ---
 def get_pdf_text(file_bytes):
     try:
         text_output = []
@@ -300,16 +291,14 @@ def extract_text_from_file(file_bytes, ext):
         elif 'xlsx' in ext or 'xlsm' in ext: return get_xlsx_text(file_bytes)
         elif 'xls' in ext: return get_xls_text(file_bytes)
         elif 'hwp' == ext:
-            # 1. LibreOffice 변환 시도
-            print("  🔄 [변환] HWP -> DOCX 변환 시도 (LibreOffice)")
+            # 1. LibreOffice 변환 시도 (Plan A)
             docx_bytes = convert_hwp_to_docx(file_bytes)
-            
             if docx_bytes:
-                print("  ✨ [성공] DOCX 변환 성공 -> 표 파싱 진행")
                 return get_docx_text(docx_bytes)
             else:
-                print("  ⚠️ [실패] 변환 실패 -> 백업 방식(텍스트 정제) 사용")
-                return get_hwp_text_fallback(file_bytes) # 수정된 함수 호출
+                # 2. 실패 시 백업 파서 사용 (Plan B)
+                print("  ⚠️ [백업 실행] LibreOffice 실패 -> 텍스트 정제 모드")
+                return get_hwp_text_fallback(file_bytes)
         else: return f"(지원하지 않는 파일: {ext})"
     except Exception as e: return f"시스템 에러: {str(e)}"
 

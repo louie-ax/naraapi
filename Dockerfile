@@ -1,20 +1,26 @@
 # 1. 베이스 이미지 (파이썬 3.11)
 FROM python:3.11-slim
 
-# 2. 환경변수 설정 (설치 중 멈춤 방지 & Java 경로)
+# 2. 환경변수 설정
 ENV DEBIAN_FRONTEND=noninteractive \
     JAVA_HOME=/usr/lib/jvm/default-java \
     PYTHONUNBUFFERED=1
 
-# 3. 필수 패키지 설치 (단순화 & 최적화)
-# --no-install-recommends: 꼭 필요한 것만 설치해서 용량을 줄이고 에러 방지
-# libreoffice-writer와 java-common만 설치하면 나머지 그래픽 라이브러리는 알아서 설치됩니다.
+# 3. 필수 패키지 설치 (LibreOffice 및 의존성 강화)
+# libreoffice-java-common: Java 의존성 해결
+# fonts-nanum: 한글 폰트 깨짐 방지
+# libgl1-mesa-glx, libxinerama1 등: Headless 실행 시 필요한 그래픽 라이브러리
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libreoffice-writer \
     libreoffice-java-common \
     default-jre \
     fonts-nanum \
+    libgl1-mesa-glx \
+    libxinerama1 \
+    libxcursor1 \
+    libxrandr2 \
+    libxi6 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
