@@ -17,7 +17,7 @@ from docx.oxml.table import CT_Tbl
 from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 from io import BytesIO
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from supabase import create_client
 from datetime import datetime
 from pydantic import BaseModel
@@ -27,17 +27,13 @@ from typing import Dict, Any, Optional
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-print("\n========== [Parser Worker v10.2 HWP Logic Update] ==========")
+print("\n========== [Parser Worker v12.0 Final HWP Logic] ==========")
 if SUPABASE_URL: print(f"✅ URL Loaded")
 else: print("❌ URL Missing")
-print("============================================================\n")
+print("===========================================================\n")
 
 app = FastAPI()
-
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-else:
-    supabase = None
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
 
 class SupabaseWebhook(BaseModel):
     type: str = "INSERT"
@@ -46,30 +42,24 @@ class SupabaseWebhook(BaseModel):
     schema_name: str = "public"
     old_record: Optional[Dict[str, Any]] = None
 
-# --- [1. LibreOffice 변환 함수 (Render/Docker 권한 문제 해결판)] ---
-# --- [1. LibreOffice 변환 함수 (UserInstallation 옵션 추가)] ---
+# --- [1. LibreOffice 변환 함수 (Docker 환경용)] ---
 def convert_hwp_to_docx(hwp_bytes):
+    # 임시 파일 경로 설정 (/tmp 사용)
     temp_dir = "/tmp"
-    # 파일명에 타임스탬프를 넣어 겹치지 않게 함
     unique_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
     filename = os.path.join(temp_dir, f"source_{unique_id}.hwp")
     docx_filename = os.path.join(temp_dir, f"source_{unique_id}.docx")
     
     try:
-        # 1. HWP 파일 저장
+        # HWP 파일 저장
         with open(filename, "wb") as f:
             f.write(hwp_bytes)
         
-        # 파일이 진짜 잘 저장됐는지 크기 확인 (디버깅용)
         file_size = os.path.getsize(filename)
-        print(f"  🔄 [LibreOffice] 변환 시작... (파일크기: {file_size} bytes, 경로: {filename})")
-        
-        if file_size == 0:
-            print("  ❌ [오류] 다운로드된 파일 크기가 0입니다.")
-            return None
+        print(f"  🔄 [LibreOffice] 변환 시작... (파일크기: {file_size} bytes)")
 
-        # 2. 변환 명령 실행 (핵심: -env 옵션으로 프로필 격리)
-        # 이렇게 하면 권한 문제 없이 임시 폴더에서 실행됨
+        # 변환 명령 실행
+        # -env:UserInstallation 옵션으로 프로필 격리 (권한 문제 해결)
         cmd = [
             "soffice", 
             "--headless", 
@@ -81,12 +71,16 @@ def convert_hwp_to_docx(hwp_bytes):
         
         result = subprocess.run(
             cmd,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            capture_output=True, # stdout, stderr 캡처
+            text=True            # 텍스트로 결과 받기
         )
         
-        # 3. 결과 확인
+        if result.returncode != 0:
+            print(f"  ❌ [LibreOffice 에러] Return Code: {result.returncode}")
+            # 에러 메시지 출력 (줄바꿈 제거)
+            print(f"  [STDERR]: {result.stderr.replace('\n', ' ')}")
+            return None
+            
         if os.path.exists(docx_filename):
             print("  ✨ [LibreOffice] 변환 성공! DOCX 생성됨.")
             with open(docx_filename, "rb") as f:
@@ -94,22 +88,19 @@ def convert_hwp_to_docx(hwp_bytes):
             return docx_bytes
         else:
             print(f"  ⚠️ [LibreOffice 실패] 변환 파일 없음.")
-            # 에러 로그 출력 (줄바꿈 정리)
-            err_msg = result.stderr.decode('utf-8', errors='ignore').replace('\n', ' ')
-            print(f"  [STDERR]: {err_msg}")
             return None
 
     except Exception as e:
         print(f"  ⚠️ [시스템 에러] 변환 중 예외: {e}")
         return None
     finally:
-        # 4. 청소 (원본, 결과물, 프로필 폴더 등은 OS가 /tmp 정리할 때 놔두거나 직접 삭제)
+        # 파일 청소
         if os.path.exists(filename): os.remove(filename)
         if os.path.exists(docx_filename): os.remove(docx_filename)
-        # 프로필 폴더는 남겨도 /tmp라서 자동 삭제됨
+        # 프로필 디렉토리는 /tmp에 생성되므로 자동 삭제됨 (또는 명시적 삭제 추가 가능)
 
 # --- [2. HWP 파싱 (백업용 - 강력 정제 적용)] ---
-def get_hwp_text(file_bytes):
+def get_hwp_text_fallback(file_bytes):
     try:
         f = BytesIO(file_bytes)
         ole = olefile.OleFileIO(f)
@@ -126,25 +117,21 @@ def get_hwp_text(file_bytes):
             try: unpacked_data = zlib.decompress(data, -15)
             except: unpacked_data = data
             
-            # 1차 디코딩
             decoded = unpacked_data.decode('utf-16le', errors='ignore')
             raw_text += decoded
 
-        # 배포용 문서 체크
         if "배포용 문서입니다" in raw_text or "Distribution" in raw_text:
              return "(⚠️ 암호화된 배포용 HWP 문서는 텍스트 추출이 불가능합니다)"
 
-        # --- [★ 정제 로직 ★] ---
-        # 1. 허용된 문자만 남기기
+        # 정제: 한글, 영문, 숫자, 기본 특수문자만 남김
         cleaned_text = re.sub(r'[^가-힣a-zA-Z0-9\s\.\,\-\(\)\[\]\%\~\:\/\_]', '', raw_text)
         
-        # 2. 쓰레기 줄(Line) 제거
+        # 쓰레기 줄 제거
         final_lines = []
         for line in cleaned_text.split('\n'):
             line = line.strip()
             if len(line) < 2: continue
-            
-            # 유효성 검사: 한글이 있거나, 숫자가 2자리 이상 포함된 줄만 살림
+            # 한글이나 숫자가 포함된 줄만 살림
             if re.search(r'[가-힣]', line) or re.search(r'[0-9]{2,}', line):
                 final_lines.append(line)
 
@@ -212,7 +199,7 @@ def get_xls_text(file_bytes):
         return text
     except Exception as e: return f"(XLS 오류: {str(e)})"
 
-# --- [5. DOCX 파싱] ---
+# --- [5. DOCX 파싱 (순서 정렬)] ---
 def iter_block_items(parent):
     if isinstance(parent, _Document):
         parent_elm = parent.element.body
@@ -253,7 +240,7 @@ def get_docx_text(file_bytes):
         return "\n".join(full_text)
     except Exception as e: return f"(DOCX 오류: {str(e)})"
 
-# --- [6. PDF 파싱] ---
+# --- [6. PDF 파싱 (표 중복 제거)] ---
 def get_pdf_text(file_bytes):
     try:
         text_output = []
@@ -322,55 +309,56 @@ def extract_text_from_file(file_bytes, ext):
                 return get_docx_text(docx_bytes)
             else:
                 print("  ⚠️ [실패] 변환 실패 -> 백업 방식(텍스트 정제) 사용")
-                return get_hwp_text(file_bytes) # 수정된 함수 호출
+                return get_hwp_text_fallback(file_bytes) # 수정된 함수 호출
         else: return f"(지원하지 않는 파일: {ext})"
     except Exception as e: return f"시스템 에러: {str(e)}"
 
-# --- [엔드포인트] ---
+# --- [비동기 작업 함수] ---
+async def process_parsing(record: Dict[str, Any]):
+    bid_no = record.get('bidNtceNo')
+    bid_ord = record.get('bidNtceOrd')
+    
+    print(f"🚀 [작업 시작] {bid_no}-{bid_ord}")
+    supabase.table('bid_notices').update({'process_status': 'PROCESSING'}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
+    
+    full_log = ""
+    for i in range(1, 11):
+        url = record.get(f"ntceSpecDocUrl{i}")
+        name = record.get(f"ntceSpecFileNm{i}", f"File_{i}")
+
+        if url and str(url).startswith("http"):
+            print(f"  📥 [다운로드] {name}")
+            try:
+                resp = requests.get(url, timeout=60)
+                text = extract_text_from_file(resp.content, name.split('.')[-1])
+                
+                supabase.table('bid_attachments').insert({
+                    "bidNtceNo": bid_no, "bidNtceOrd": bid_ord,
+                    "file_name": name, "file_url": url, "file_type": name.split('.')[-1],
+                    "extracted_text": text
+                }).execute()
+                full_log += f"  💾 [성공] {name} ({len(text)}자)\n"
+            except Exception as e:
+                full_log += f"  ❌ [실패] {name}\n"
+                print(f"실패: {e}")
+
+    supabase.table('bid_notices').update({'process_status': 'DONE', 'parsed_content': full_log, 'updated_at': datetime.now().isoformat()}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
+    print(f"✅ [완료] {bid_no}")
+
+# --- [메인 엔드포인트] ---
 @app.get("/")
 def read_root():
-    return {"status": "Worker v10.2 (HWP Logic Update)"}
+    return {"status": "Worker v12.0 (Final)"}
 
 @app.post("/parse")
-async def parse_notice(payload: SupabaseWebhook):
+async def parse_notice(payload: SupabaseWebhook, background_tasks: BackgroundTasks):
     if not supabase: return {"status": "Error", "msg": "Env Vars Missing"}
-
-    try:
-        record = payload.record
-        if not record: return {"msg": "No record"}
-
-        bid_no = record.get('bidNtceNo')
-        bid_ord = record.get('bidNtceOrd')
-        if record.get('process_status') != 'NEW': return {"msg": "Skipped"}
-        
-        print(f"🚀 [시작] {bid_no}-{bid_ord}")
-        supabase.table('bid_notices').update({'process_status': 'PROCESSING'}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
-        
-        full_log = ""
-        for i in range(1, 11):
-            url = record.get(f"ntceSpecDocUrl{i}")
-            name = record.get(f"ntceSpecFileNm{i}", f"File_{i}")
-
-            if url and str(url).startswith("http"):
-                print(f"  📥 [다운로드] {name}")
-                try:
-                    resp = requests.get(url, timeout=60)
-                    text = extract_text_from_file(resp.content, name.split('.')[-1])
-                    
-                    supabase.table('bid_attachments').insert({
-                        "bidNtceNo": bid_no, "bidNtceOrd": bid_ord,
-                        "file_name": name, "file_url": url, "file_type": name.split('.')[-1],
-                        "extracted_text": text
-                    }).execute()
-                    full_log += f"  💾 [성공] {name} ({len(text)}자)\n"
-                except Exception as e:
-                    full_log += f"  ❌ [실패] {name}\n"
-                    print(f"실패: {e}")
-
-        supabase.table('bid_notices').update({'process_status': 'DONE', 'parsed_content': full_log, 'updated_at': datetime.now().isoformat()}).eq('bidNtceNo', bid_no).eq('bidNtceOrd', bid_ord).execute()
-        print(f"✅ [완료] {bid_no}")
-        return {"status": "Success"}
-
-    except Exception as e:
-        print(f"❌ [에러] {e}")
-        return {"status": "Error", "msg": str(e)}
+    
+    record = payload.record
+    if not record: return {"msg": "No record"}
+    if record.get('process_status') != 'NEW': return {"msg": "Skipped"}
+    
+    # 비동기 작업 등록 (즉시 응답 후 백그라운드 실행)
+    background_tasks.add_task(process_parsing, record)
+    
+    return {"status": "Accepted", "msg": "Background task started"}
