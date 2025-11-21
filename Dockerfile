@@ -1,19 +1,22 @@
-# 1. 베이스 이미지
+# 1. 베이스 이미지 (파이썬 3.11)
 FROM python:3.11-slim
 
-# 2. 필수 패키지 및 LibreOffice 의존성 설치 (중요!)
-# libreoffice-java-common과 함께 headless 실행에 필요한 그래픽 라이브러리들을 추가합니다.
-RUN apt-get update && apt-get install -y \
-    libreoffice \
-    libreoffice-writer \
-    fonts-nanum \
-    default-jre \
-    libreoffice-java-common \
-    libxinerama1 libx11-xcb1 libxrandr2 libxi6 libgl1-mesa-glx \
-    && rm -rf /var/lib/apt/lists/*
+# 2. 환경변수 설정 (설치 중 멈춤 방지 & Java 경로)
+ENV DEBIAN_FRONTEND=noninteractive \
+    JAVA_HOME=/usr/lib/jvm/default-java \
+    PYTHONUNBUFFERED=1
 
-# 3. Java 환경변수 설정
-ENV JAVA_HOME=/usr/lib/jvm/default-java
+# 3. 필수 패키지 설치 (단순화 & 최적화)
+# --no-install-recommends: 꼭 필요한 것만 설치해서 용량을 줄이고 에러 방지
+# libreoffice-writer와 java-common만 설치하면 나머지 그래픽 라이브러리는 알아서 설치됩니다.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libreoffice-writer \
+    libreoffice-java-common \
+    default-jre \
+    fonts-nanum \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # 4. 작업 디렉토리 설정
 WORKDIR /app
